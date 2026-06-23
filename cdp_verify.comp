@@ -1,0 +1,177 @@
+#version 450
+// cdp_verify.comp — forward chain walk + SHA256 comparison
+// For each candidate (start_str, pos):
+//   cur = start_str
+//   for step in 0..pos-1: cur = cdp_reduce_inj(sha256(cur), step)
+//   if sha256(cur) == target_hash: found=1, write cur to results
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    int n_candidates;
+    int cs_len;
+    int str_len;
+    int pad;
+} pc;
+
+// Binding 0: start strings  — n × str_len uint32 (one uint per char, ASCII value)
+// Binding 1: positions      — n uint32
+// Binding 2: target hash    — 8 uint32 (big-endian SHA256 words)
+// Binding 3: charset        — cs_len uint32
+// Binding 4: found flags    — n uint32  (0=not found, 1=found)
+// Binding 5: result strings — n × str_len uint32 (written when found=1)
+
+layout(set=0, binding=0) readonly buffer Starts    { uint d[]; } starts;
+layout(set=0, binding=1) readonly buffer Positions { uint d[]; } positions;
+layout(set=0, binding=2) readonly buffer TgtHash   { uint d[]; } tgt;
+layout(set=0, binding=3) readonly buffer Charset   { uint d[]; } cs;
+layout(set=0, binding=4)          buffer Found     { uint d[]; } found;
+layout(set=0, binding=5)          buffer Results   { uint d[]; } results;
+
+// --- 64-bit helpers: uvec2(lo, hi) -----------------------------------------
+uvec2 mul64(uvec2 a, uvec2 b) {
+    uint lo, hi;
+    umulExtended(a.x, b.x, hi, lo);
+    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
+}
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint lo = a.x + b.x;
+    return uvec2(lo, a.y + b.y + uint(lo < a.x));
+}
+uvec2 xor64(uvec2 a, uvec2 b) { return uvec2(a.x ^ b.x, a.y ^ b.y); }
+uvec2 shr64(uvec2 a, uint n) {
+    if (n == 0u)  return a;
+    if (n < 32u)  return uvec2((a.x >> n) | (a.y << (32u - n)), a.y >> n);
+    if (n == 32u) return uvec2(a.y, 0u);
+    return uvec2(a.y >> (n - 32u), 0u);
+}
+
+// 64-bit constants as uvec2(lo, hi) -- verified from Python source
+const uvec2 W_MULT  = uvec2(0x7F4A7C15u, 0x9E3779B9u); // 0x9E3779B97F4A7C15
+const uvec2 LCG_M   = uvec2(0x4C957F2Du, 0x5851F42Du); // 6364136223846793005
+const uvec2 WV_MULT = uvec2(0xE5F60718u, 0xA3B2C1D4u); // 0xA3B2C1D4E5F60718
+const uvec2 LCG_I   = uvec2(0xF767814Fu, 0x14057B7Eu); // 1442695040888963407
+const uvec2 PCG1    = uvec2(0x1CE4E5B9u, 0xBF58476Du); // 0xBF58476D1CE4E5B9
+const uvec2 PCG2    = uvec2(0x133111EBu, 0x94D049BBu); // 0x94D049BB133111EB
+
+// --- SHA256 ----------------------------------------------------------------
+const uint K[64] = uint[64](
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+    0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+    0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+    0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+    0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+    0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+    0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+    0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+    0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+    0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+    0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+    0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+    0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+);
+
+uint rotr(uint x, uint n) { return (x >> n) | (x << (32u - n)); }
+
+void sha256_opt(uint s[16], int slen, inout uint h[8]) {
+    h[0]=0x6a09e667u; h[1]=0xbb67ae85u; h[2]=0x3c6ef372u; h[3]=0xa54ff53au;
+    h[4]=0x510e527fu; h[5]=0x9b05688cu; h[6]=0x1f83d9abu; h[7]=0x5be0cd19u;
+    uint W[64];
+    // Zero-initialize all words first
+    for (int i = 0; i < 16; i++) W[i] = 0u;
+    // Copy message bytes — only access s[] within [0, slen)
+    for (int b = 0; b < slen; b++)
+        W[b >> 2] |= s[b] << uint(24 - (b & 3) * 8);
+    // SHA256 padding: 0x80 byte after message
+    W[slen >> 2] |= 0x80u << uint(24 - (slen & 3) * 8);
+    // Length field (last word): bit count of message
+    W[15] = uint(slen << 3);
+    for (int i = 16; i < 64; i++) {
+        uint s0 = rotr(W[i-15],7u) ^ rotr(W[i-15],18u) ^ (W[i-15] >> 3u);
+        uint s1 = rotr(W[i-2], 17u) ^ rotr(W[i-2], 19u) ^ (W[i-2]  >> 10u);
+        W[i] = W[i-16] + s0 + W[i-7] + s1;
+    }
+    uint a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for (int i = 0; i < 64; i++) {
+        uint S1 = rotr(e,6u)  ^ rotr(e,11u) ^ rotr(e,25u);
+        uint ch = (e & f) ^ (~e & g);
+        uint t1 = hh + S1 + ch + K[i] + W[i];
+        uint S0 = rotr(a,2u)  ^ rotr(a,13u) ^ rotr(a,22u);
+        uint mj = (a & b) ^ (a & c) ^ (b & c);
+        uint t2 = S0 + mj;
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
+    h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+}
+
+// --- CDP-injective reduction (matches py_reduce_inj exactly) ---------------
+void cdp_reduce_inj(uint h[8], int step, int cs_len, int str_len, out uint s[16]) {
+    uint W = 0u, mx = 0u, mn = 15u;
+    uint wv[16];
+    for (int i = 0; i < 8; i++) {
+        uint d = h[i];
+        uint n0=(d>>28u)&0xFu, n1=(d>>24u)&0xFu, n2=(d>>20u)&0xFu, n3=(d>>16u)&0xFu;
+        uint n4=(d>>12u)&0xFu, n5=(d>> 8u)&0xFu, n6=(d>> 4u)&0xFu, n7= d      &0xFu;
+        wv[i*2  ] = n0+n1+n2+n3;
+        wv[i*2+1] = n4+n5+n6+n7;
+        W += wv[i*2] + wv[i*2+1];
+        mx = max(mx, max(max(n0,n1), max(max(n2,n3), max(max(n4,n5), max(n6,n7)))));
+        mn = min(mn, min(min(n0,n1), min(min(n2,n3), min(min(n4,n5), min(n6,n7)))));
+    }
+    uvec2 seed = mul64(uvec2(W, 0u), W_MULT);
+    for (int i = 0; i < 16; i++)
+        seed = xor64(mul64(seed, LCG_M),
+                     mul64(uvec2(wv[i] * uint(i+1), 0u), WV_MULT));
+    seed = xor64(seed, uvec2(mn, mx));
+    seed = xor64(seed, mul64(uvec2(uint(step), 0u), LCG_I));
+    seed = xor64(seed, shr64(seed, 30u));
+    seed = mul64(seed, PCG1);
+    seed = xor64(seed, shr64(seed, 27u));
+    seed = mul64(seed, PCG2);
+    seed = xor64(seed, shr64(seed, 31u));
+    for (int i = 0; i < str_len; i++) {
+        seed = add64(mul64(seed, LCG_M), LCG_I);
+        s[i] = cs.d[(seed.y >> 1u) % uint(cs_len)];
+    }
+}
+
+// --- Main: forward walk + compare ------------------------------------------
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= pc.n_candidates) return;
+
+    // Load start string into local array (ASCII byte values as uint)
+    uint cur[16];
+    for (int i = 0; i < pc.str_len; i++)
+        cur[i] = starts.d[gid * pc.str_len + i];
+
+    int pos = int(positions.d[gid]);
+
+    // Walk chain pos steps forward
+    uint digest[8];
+    for (int step = 0; step < pos; step++) {
+        sha256_opt(cur, pc.str_len, digest);
+        cdp_reduce_inj(digest, step, pc.cs_len, pc.str_len, cur);
+    }
+
+    // Hash the current string
+    sha256_opt(cur, pc.str_len, digest);
+
+    // Compare with target hash
+    bool match = true;
+    for (int i = 0; i < 8; i++) {
+        if (digest[i] != tgt.d[i]) { match = false; break; }
+    }
+
+    found.d[gid] = match ? 1u : 0u;
+
+    // Write plaintext result if found
+    if (match) {
+        for (int i = 0; i < pc.str_len; i++)
+            results.d[gid * pc.str_len + i] = cur[i];
+    }
+}
