@@ -184,7 +184,7 @@ See [LICENSE](LICENSE) for full terms.
 ---
 
 ## References
-
+- Blog Post: https://netacoding.com/posts/cdp-sha256-structural-analysis/
 - Erenay Özkan. *CDP: Cyclic Digit-sum Projection — Structural Analysis of SHA-256 Output Distribution, Ergodic Basin Pressure, and Input Class Fingerprinting.* v3, 2026. DOI: [10.5281/zenodo.20627240](https://doi.org/10.5281/zenodo.20627240)
 - P. Oechslin. *Making a Faster Cryptanalytic Time-Memory Trade-Off.* CRYPTO 2003.
 - M. Hellman. *A Cryptanalytic Time-Memory Trade-Off.* IEEE Trans. Inf. Theory, 1980.
